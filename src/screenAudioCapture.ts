@@ -1,0 +1,138 @@
+function floatTo16BitPcm(input: Float32Array): Int16Array {
+  const output = new Int16Array(input.length);
+
+  for (let index = 0; index < input.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, input[index]));
+    output[index] = sample < 0 ? sample * 32768 : sample * 32767;
+  }
+
+  return output;
+}
+
+function downsampleBuffer(
+  input: Float32Array,
+  inputSampleRate: number,
+  outputSampleRate: number
+): Float32Array {
+  if (outputSampleRate === inputSampleRate) {
+    return input;
+  }
+
+  if (outputSampleRate > inputSampleRate) {
+    throw new Error("Output sample rate must be lower than input sample rate.");
+  }
+
+  const sampleRateRatio = inputSampleRate / outputSampleRate;
+  const outputLength = Math.round(input.length / sampleRateRatio);
+  const output = new Float32Array(outputLength);
+
+  let outputIndex = 0;
+  let inputIndex = 0;
+
+  while (outputIndex < outputLength) {
+    const nextInputIndex = Math.round((outputIndex + 1) * sampleRateRatio);
+    let accumulator = 0;
+    let count = 0;
+
+    for (
+      let sampleIndex = inputIndex;
+      sampleIndex < nextInputIndex && sampleIndex < input.length;
+      sampleIndex += 1
+    ) {
+      accumulator += input[sampleIndex];
+      count += 1;
+    }
+
+    output[outputIndex] = count > 0 ? accumulator / count : 0;
+
+    outputIndex += 1;
+    inputIndex = nextInputIndex;
+  }
+
+  return output;
+}
+
+function arrayBufferToBase64(buffer: ArrayBufferLike) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+
+  for (let index = 0; index < bytes.byteLength; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+
+  return window.btoa(binary);
+}
+
+export class ScreenAudioCapture {
+  private audioContext: AudioContext | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
+  private processorNode: ScriptProcessorNode | null = null;
+  private audioOnlyStream: MediaStream | null = null;
+  private onAudioChunk: (base64Audio: string) => void;
+
+  constructor(onAudioChunk: (base64Audio: string) => void) {
+    this.onAudioChunk = onAudioChunk;
+  }
+
+  async start(displayStream: MediaStream) {
+    if (this.audioContext || this.audioOnlyStream) {
+      return;
+    }
+
+    const audioTracks = displayStream.getAudioTracks();
+
+    if (audioTracks.length === 0) {
+      throw new Error("No screen audio track found.");
+    }
+
+    this.audioOnlyStream = new MediaStream(audioTracks);
+
+    this.audioContext = new AudioContext();
+    await this.audioContext.resume();
+
+    this.sourceNode = this.audioContext.createMediaStreamSource(
+      this.audioOnlyStream
+    );
+
+    this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
+
+    this.processorNode.onaudioprocess = (event) => {
+      if (!this.audioContext) return;
+
+      const input = event.inputBuffer.getChannelData(0);
+      const downsampled = downsampleBuffer(
+        input,
+        this.audioContext.sampleRate,
+        16000
+      );
+
+      const pcm16 = floatTo16BitPcm(downsampled);
+      const base64Audio = arrayBufferToBase64(pcm16.buffer);
+
+      this.onAudioChunk(base64Audio);
+    };
+
+    this.sourceNode.connect(this.processorNode);
+    this.processorNode.connect(this.audioContext.destination);
+  }
+
+  async stop() {
+    if (this.processorNode) {
+      this.processorNode.disconnect();
+      this.processorNode.onaudioprocess = null;
+      this.processorNode = null;
+    }
+
+    if (this.sourceNode) {
+      this.sourceNode.disconnect();
+      this.sourceNode = null;
+    }
+
+    if (this.audioContext) {
+      await this.audioContext.close();
+      this.audioContext = null;
+    }
+
+    this.audioOnlyStream = null;
+  }
+}
