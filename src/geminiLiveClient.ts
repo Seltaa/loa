@@ -9,6 +9,7 @@ type GeminiLiveClientOptions = {
   model?: string;
   systemInstruction: string;
   voiceName: string;
+  resumptionHandle?: string;
   onOpen?: () => void;
   onSetupComplete?: () => void;
   onMessage?: (message: unknown) => void;
@@ -17,7 +18,7 @@ type GeminiLiveClientOptions = {
   onOutputText?: (text: string) => void;
   onAudioChunk?: (base64Audio: string) => void;
   onError?: (message: string) => void;
-  onClose?: () => void;
+  onClose?: (code: number, reason: string) => void;
 };
 
 const DEFAULT_MODEL = "gemini-3.1-flash-live-preview";
@@ -77,6 +78,7 @@ export class GeminiLiveClient {
       "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
       `?key=${encodedKey}`;
 
+    this.disconnect();
     this.websocket = new WebSocket(url);
     this.websocket.binaryType = "arraybuffer";
 
@@ -96,6 +98,10 @@ export class GeminiLiveClient {
               },
             },
           },
+          sessionResumption: this.options.resumptionHandle ? { handle: this.options.resumptionHandle } : {},
+          contextWindowCompression: { slidingWindow: {} },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
           systemInstruction: {
             parts: [
               {
@@ -106,20 +112,22 @@ export class GeminiLiveClient {
         },
       };
 
-      console.log("Gemini Live setup:", setupMessage);
+
       this.websocket?.send(JSON.stringify(setupMessage));
     };
 
+    const socket = this.websocket;
     this.websocket.onmessage = async (event) => {
       try {
         const raw = await readWebSocketData(event.data);
+        if (this.websocket !== socket) return;
 
         if (!raw.trim()) return;
 
         const message = JSON.parse(raw);
 
-        console.log("Gemini Live message:", message);
-        this.options.onMessage?.(message);
+
+
 
         if (message.setupComplete) {
           this.options.onSetupComplete?.();
@@ -149,8 +157,9 @@ export class GeminiLiveClient {
         for (const chunk of audioChunks) {
           this.options.onAudioChunk?.(chunk);
         }
+        this.options.onMessage?.(message);
       } catch (error) {
-        console.error("Gemini Live parse failed:", error, event.data);
+        console.error("Gemini Live parse failed:", error);
         this.options.onError?.("Failed to parse Gemini Live message.");
       }
     };
@@ -168,7 +177,7 @@ export class GeminiLiveClient {
       });
 
       this.websocket = null;
-      this.options.onClose?.();
+      this.options.onClose?.(event.code, event.reason);
     };
   }
 
@@ -180,18 +189,8 @@ export class GeminiLiveClient {
 
     this.websocket.send(
       JSON.stringify({
-        clientContent: {
-          turns: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text,
-                },
-              ],
-            },
-          ],
-          turnComplete: true,
+        realtimeInput: {
+          text,
         },
       })
     );
@@ -214,7 +213,7 @@ export class GeminiLiveClient {
     );
   }
 
-  sendVideoFrame(base64Jpeg: string) {
+  sendVideoFrame(base64Image: string, mimeType = "image/jpeg") {
     if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
       return;
     }
@@ -223,8 +222,8 @@ export class GeminiLiveClient {
       JSON.stringify({
         realtimeInput: {
           video: {
-            mimeType: "image/jpeg",
-            data: base64Jpeg,
+            mimeType,
+            data: base64Image,
           },
         },
       })
@@ -233,9 +232,17 @@ export class GeminiLiveClient {
 
   disconnect() {
     if (this.websocket) {
+      this.websocket.onopen = null;
+      this.websocket.onmessage = null;
+      this.websocket.onerror = null;
+      this.websocket.onclose = null;
       this.websocket.close();
       this.websocket = null;
     }
+  }
+
+  isActive() {
+    return this.websocket?.readyState === WebSocket.CONNECTING || this.websocket?.readyState === WebSocket.OPEN;
   }
 
   isConnected() {

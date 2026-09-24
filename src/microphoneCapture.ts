@@ -52,7 +52,7 @@ function downsampleBuffer(
   return output;
 }
 
-function arrayBufferToBase64(buffer: ArrayBufferLike) {
+function arrayBufferToBase64(buffer: ArrayBuffer) {
   const bytes = new Uint8Array(buffer);
   let binary = "";
 
@@ -108,7 +108,11 @@ export class MicrophoneCapture {
       );
 
       const pcm16 = floatTo16BitPcm(downsampled);
-      const base64Audio = arrayBufferToBase64(pcm16.buffer);
+      const pcmBuffer = pcm16.buffer.slice(
+        pcm16.byteOffset,
+        pcm16.byteOffset + pcm16.byteLength
+      ) as ArrayBuffer;
+      const base64Audio = arrayBufferToBase64(pcmBuffer);
 
       this.onAudioChunk(base64Audio);
     };

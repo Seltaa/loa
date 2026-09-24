@@ -333,6 +333,8 @@ button:disabled {
   backdrop-filter: blur(24px);
   box-shadow: var(--inner), var(--shadow);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .panelHeader {
@@ -341,7 +343,8 @@ button:disabled {
 }
 
 .messageList {
-  height: calc(100% - 30px);
+  height: auto;
+  flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -351,6 +354,121 @@ button:disabled {
   padding-right: 6px;
   scrollbar-width: thin;
   scroll-behavior: smooth;
+}
+
+.hiddenLiveFileInput {
+  display: none;
+}
+
+.commsComposer {
+  flex: 0 0 auto;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(125, 155, 198, 0.18);
+}
+
+.liveAttachmentArea {
+  margin-bottom: 7px;
+}
+
+.liveAttachmentList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.liveAttachmentChip {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid rgba(113, 143, 197, 0.2);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.5);
+  color: #50647f;
+  font-size: 0.68rem;
+}
+
+.liveAttachmentChip span {
+  color: #5d7ff2;
+  font-size: 0.58rem;
+  font-weight: 900;
+}
+
+.liveAttachmentChip strong {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.liveAttachmentChip button {
+  padding: 0;
+  color: #72829a;
+  background: transparent;
+  font-size: 0.9rem;
+}
+
+.liveAttachmentArea p {
+  margin: 5px 2px 0;
+  color: #74859d;
+  font-size: 0.62rem;
+}
+
+.commsInputRow {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 34px;
+  align-items: end;
+  gap: 7px;
+}
+
+.commsInputRow textarea {
+  width: 100%;
+  min-height: 38px;
+  max-height: 110px;
+  padding: 9px 10px;
+  border: 1px solid rgba(113, 143, 197, 0.22);
+  border-radius: 13px;
+  outline: none;
+  resize: vertical;
+  color: #314057;
+  background: rgba(255, 255, 255, 0.58);
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.commsInputRow textarea:focus {
+  border-color: rgba(96, 117, 255, 0.45);
+  box-shadow: 0 0 0 3px rgba(104, 126, 255, 0.09);
+}
+
+.commsAttachButton,
+.commsSendButton {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(113, 143, 197, 0.2);
+  border-radius: 11px;
+  color: #5f72da;
+  background: rgba(255, 255, 255, 0.58);
+  font-weight: 900;
+}
+
+.commsSendButton {
+  width: 34px;
+  height: 34px;
+  color: white;
+  border: 0;
+  background: linear-gradient(135deg, #58b8ff, #7068ff);
+}
+
+.commsSendButton:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .message {
@@ -867,32 +985,6 @@ button:disabled {
   flex-wrap: wrap;
 }
 
-.privacyStatus {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 44px;
-  padding: 0 15px;
-  border-radius: 999px;
-  color: #526780;
-  background: rgba(255, 255, 255, 0.55);
-  border: 1px solid rgba(117, 149, 198, 0.18);
-  font-size: 0.82rem;
-  font-weight: 800;
-}
-
-.privacyDot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #9badc2;
-}
-
-.privacyDot.active {
-  background: #ef5f78;
-  box-shadow: 0 0 0 5px rgba(239, 95, 120, 0.12);
-}
-
 .primaryButton,
 .secondaryButton {
   padding: 14px 21px;
@@ -923,16 +1015,6 @@ button:disabled {
 .dangerSoft:hover {
   border-color: rgba(196, 103, 125, 0.45);
   background: rgba(255, 238, 244, 0.95);
-}
-
-.privacyStop {
-  color: #fff;
-  border-color: #be4560;
-  background: #c84e68;
-}
-
-.privacyStop:hover:not(:disabled) {
-  background: #ad3e56;
 }
 
 .memoryPanel {

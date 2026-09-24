@@ -5,16 +5,18 @@ type VideoFrameCaptureOptions = {
 };
 
 export class VideoFrameCapture {
+  private previous: Uint8ClampedArray | null = null;
+  private sample = document.createElement("canvas");
   private timerId: number | null = null;
   private canvas: HTMLCanvasElement;
   private context: CanvasRenderingContext2D | null;
-  private onFrame: (base64Jpeg: string) => void;
+  private onFrame: (base64Jpeg: string, changed: boolean) => void;
   private intervalMs: number;
   private jpegQuality: number;
   private maxWidth: number;
 
   constructor(
-    onFrame: (base64Jpeg: string) => void,
+    onFrame: (base64Jpeg: string, changed: boolean) => void,
     options: VideoFrameCaptureOptions = {}
   ) {
     this.onFrame = onFrame;
@@ -54,7 +56,20 @@ export class VideoFrameCapture {
       const base64 = dataUrl.split(",")[1];
 
       if (base64) {
-        this.onFrame(base64);
+        this.sample.width=32;this.sample.height=18;
+        const ctx=this.sample.getContext("2d");
+        let changed=false;
+        if(ctx){
+          ctx.drawImage(videoElement,0,0,32,18);
+          const pixels=ctx.getImageData(0,0,32,18).data;
+          if(this.previous){
+            let difference=0;
+            for(let i=0;i<pixels.length;i+=4)difference+=(Math.abs(pixels[i]-this.previous[i])+Math.abs(pixels[i+1]-this.previous[i+1])+Math.abs(pixels[i+2]-this.previous[i+2]))/3;
+            changed=difference/(32*18)>18;
+          }
+          this.previous=pixels;
+        }
+        this.onFrame(base64,changed);
       }
     };
 

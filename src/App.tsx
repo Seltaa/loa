@@ -1,15 +1,34 @@
+import { organizeMemories } from "./memoryOrganizer";
+import { ConnectionTest } from "./ConnectionTest";
+import { saveChatImages, SavedChatImage, type SavedImage } from "./chatImages";
 import { useEffect, useRef, useState } from "react";
 import { GeminiLiveClient } from "./geminiLiveClient";
 import { PcmAudioPlayer } from "./audioPlayback";
 import { MicrophoneCapture } from "./microphoneCapture";
 import { VideoFrameCapture } from "./videoFrameCapture";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "./App.css";
+import { NotebookPanel } from "./notebook";
+import { readNotebook, saveNotebook, recordMemory, recordJournal, notebookContext } from "./notebookStore";
+import "./refined.css";
+import { SettingsPanel } from "./SettingsPanel";
 
 type Role = "loa" | "you";
 
 type Message = {
   role: Role;
   text: string;
+  at?: string;
+  images?: SavedImage[];
+};
+
+type LiveAttachment = {
+  id: string;
+  name: string;
+  kind: "text" | "pdf" | "image";
+  mimeType: string;
+  textContent?: string;
+  base64Data?: string;
 };
 
 type HermesRunResponse = {
@@ -81,7 +100,7 @@ type LoaCommand =
       type: "stop_view";
     };
 
-type LoaConfig = {
+export type LoaConfig = {
   userName: string;
   loaName: string;
   geminiApiKey: string;
@@ -90,6 +109,8 @@ type LoaConfig = {
   hermesApiKey: string;
   defaultLiveSource: DefaultLiveSource;
   memoryMode: MemoryMode;
+  personalInstructions?: string;
+  proactiveMode?: "off" | "occasional" | "active";
 };
 
 type LoaMemory = {
@@ -122,6 +143,41 @@ const CONFIG_KEY = "loa-hud-config-v1";
 const MEMORY_KEY = "loa-hud-memory-v1";
 const MESSAGES_KEY = "loa-hud-messages-v1";
 
+function makeId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function dataUrlPayload(dataUrl: string) {
+  return dataUrl.includes(",") ? dataUrl.slice(dataUrl.indexOf(",") + 1) : dataUrl;
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Could not read this file."));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function extractPdfText(file: File) {
+  const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
+  GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+  const pdf = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+  const pages: string[] = [];
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const content = await page.getTextContent();
+    const text = content.items
+      .map((item) => ("str" in item ? item.str : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text) pages.push(`[Page ${pageNumber}]\n${text}`);
+  }
+  return pages.join("\n\n");
+}
+
 const GEMINI_VOICES: GeminiVoice[] = [
   "Puck",
   "Charon",
@@ -137,25 +193,20 @@ const DEFAULT_CONFIG: LoaConfig = {
   userName: "",
   loaName: "Loa",
   geminiApiKey: "",
-  geminiVoice: "Puck",
+  geminiVoice: "Leda",
   hermesUrl: "http://127.0.0.1:8642",
   hermesApiKey: "",
   defaultLiveSource: "ask",
-  memoryMode: "ask",
+  memoryMode: "auto_basic",
 };
 
-function normalizeMemoryMode(value: unknown): MemoryMode {
-  if (value === "manual") return "manual";
-  if (value === "auto_basic" || value === "auto_safe") return "auto_basic";
-  return "ask";
-}
 
 function normalizeGeminiVoice(value: unknown): GeminiVoice {
   if (typeof value === "string" && GEMINI_VOICES.includes(value as GeminiVoice)) {
     return value as GeminiVoice;
   }
 
-  return "Puck";
+  return "Leda";
 }
 
 function normalizeMemoryCategory(value: unknown): MemoryCategory {
@@ -185,13 +236,13 @@ function extractMemoryProposalFromText(text: string): {
   proposal: PendingMemoryProposal | null;
 } {
   const pattern =
-    /\[LOA_MEMORY_PROPOSAL\]([\s\S]*?)\[\/LOA_MEMORY_PROPOSAL\]/i;
+    /\[?LOA_MEMORY_PROPOSAL\]([\s\S]*?)\[\/LOA_MEMORY_PROPOSAL\]/i;
 
   const match = text.match(pattern);
 
   if (!match) {
     return {
-      visibleText: text.trim(),
+      visibleText: text.replace(/\[?LOA_MEMORY_PROPOSAL\][\s\S]*$/i, "").trim(),
       proposal: null,
     };
   }
@@ -366,7 +417,7 @@ function loadStoredConfig(): LoaConfig | null {
       ...DEFAULT_CONFIG,
       ...parsed,
       geminiVoice: normalizeGeminiVoice(parsed.geminiVoice),
-      memoryMode: normalizeMemoryMode(parsed.memoryMode),
+      memoryMode: "auto_basic",
     };
   } catch {
     return null;
@@ -377,14 +428,7 @@ function saveStoredConfig(config: LoaConfig) {
   localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
 }
 
-function createInitialMessages(config: LoaConfig): Message[] {
-  return [
-    {
-      role: "loa",
-      text: `${config.loaName} online. Hi, ${config.userName}.`,
-    },
-  ];
-}
+function createInitialMessages(_config: LoaConfig): Message[] { return []; }
 
 function loadStoredMessages(config: LoaConfig): Message[] {
   try {
@@ -412,7 +456,16 @@ function loadStoredMessages(config: LoaConfig): Message[] {
       return createInitialMessages(config);
     }
 
-    return messages.slice(-300);
+    // Recover valid memory payloads previously shown as assistant text.
+    for (const message of messages) {
+      if (message.role !== "loa" || !message.text.includes("LOA_MEMORY_PROPOSAL]")) continue;
+      const extracted = extractMemoryProposalFromText(message.text);
+      if (extracted.proposal) recordMemory(extracted.proposal.title, extracted.proposal.text);
+      message.text = extracted.visibleText;
+    }
+    const cleaned = messages.filter((message, index) => !(index === 0 && message.role === "loa" && message.text === `${config.loaName} online. Hi, ${config.userName}.`));
+    saveStoredMessages(cleaned);
+    return cleaned.slice(-300);
   } catch {
     return createInitialMessages(config);
   }
@@ -457,16 +510,9 @@ function createDefaultMemory(config: LoaConfig): LoaMemory {
     },
     userMemory: {
       name: config.userName,
-      preferences: [
-        "The user wants a screen-aware voice HUD.",
-        "The user may use Loa for work, games, creative projects, and everyday tasks.",
-      ],
-      projects: ["The user is setting up Loa HUD."],
-      workStyle: [
-        "Prefer concise UI text.",
-        "Prefer clean, minimal explanations.",
-        "Prefer voice-first interaction over chat-first interaction.",
-      ],
+      preferences: [],
+      projects: [],
+      workStyle: [],
     },
     sessionMemory: {
       currentMode: "setup",
@@ -526,15 +572,6 @@ function saveStoredMemory(memory: LoaMemory) {
   localStorage.setItem(MEMORY_KEY, JSON.stringify(memory));
 }
 
-function addUniqueItem(items: string[], item: string) {
-  const trimmed = item.trim();
-
-  if (!trimmed) return items;
-  if (items.includes(trimmed)) return items;
-
-  return [trimmed, ...items].slice(0, 20);
-}
-
 function buildRecentChatContext(messages: Message[]) {
   const recent = messages.slice(-24);
 
@@ -590,6 +627,7 @@ function buildLoaSystemPrompt(
 
   return `
 You are ${config.loaName}.
+${notebookContext()}
 
 ${memory.identity.role}
 
@@ -618,13 +656,13 @@ Memory boundaries:
 ${memory.identity.boundaries.map((item) => `- ${item}`).join("\n")}
 
 User memory:
-${memory.userMemory.preferences.map((item) => `- ${item}`).join("\n")}
+See the saved notebook above.
 
 Projects:
-${memory.userMemory.projects.map((item) => `- ${item}`).join("\n")}
+See the saved notebook above.
 
 Work style:
-${memory.userMemory.workStyle.map((item) => `- ${item}`).join("\n")}
+See the saved notebook above.
 
 Session memory:
 - Current mode: ${memory.sessionMemory.currentMode}
@@ -645,7 +683,11 @@ Language behavior:
 - If the user mixes Korean and English, follow the user's dominant language and mirror the mix lightly.
 - Do not force English just because the UI is English.
 
-Voice behavior:
+Personal conversation instructions:
+The following are user preferences for voice and chat. Follow them over generic tone and brevity defaults. They do not change tool permissions, factual accuracy, or privacy requirements.
+${typeof config.personalInstructions === "string" ? config.personalInstructions.trim().slice(0,6000) : ""}
+
+Voice behavior (defaults when no personal preference applies):
 - Speak like a relaxed friend watching the screen with the user.
 - Keep most live responses short: 1 to 2 sentences.
 - If the user is excited, match the excitement naturally.
@@ -673,18 +715,10 @@ Command behavior:
 - Do not use command tags for ordinary conversation.
 - For destructive or high-impact actions not listed above, ask for confirmation first.
 
-Memory proposal behavior:
-- If the user shares a stable preference, project detail, or work style that would help future conversations, ask naturally if they want you to remember it.
-- Do not propose memory for temporary, trivial, private, sensitive, medical, address, password, API key, or secret information.
-- Do not save memory by yourself. The app will save only after the user confirms.
-- When you ask to remember something, append exactly one machine-readable proposal tag at the very end of your response.
-- The tag must use this exact format:
-[LOA_MEMORY_PROPOSAL]{"category":"preference","title":"Short title","text":"The memory to save"}[/LOA_MEMORY_PROPOSAL]
-- Valid categories are: preference, project, workStyle, session.
-- Do not mention the tag. The user should only hear the natural question.
-- Example visible response: "게임 중엔 짧은 콜아웃 위주가 좋다는 거 기억해둘까?"
-- Example tag:
-[LOA_MEMORY_PROPOSAL]{"category":"workStyle","title":"Short game callouts","text":"The user prefers short callouts during games instead of long explanations."}[/LOA_MEMORY_PROPOSAL]
+Memory behavior:
+- A separate background organizer saves important context after conversation. Do not output memory tags or JSON in your speech or chat.
+- Do not claim that a memory was saved until it appears in the supplied saved notebook.
+- Respond naturally to requests to remember, without announcing unverified storage success.
 
 Important:
 - If no visual source is active, do not claim to see the user's screen.
@@ -692,18 +726,26 @@ Important:
 - If a visual source is active and video frames are streaming, you may discuss the visible screen.
 - Background/system/screen audio is disabled. Do not claim to hear app, game, YouTube, music, or video audio.
 - If microphone is sleeping, you may still respond to text/system messages, but you are not hearing the user's voice.
-- If you want to remember something, propose a memory save request. Do not silently save sensitive details.
+- If you want to remember something, emit the memory tag for automatic saving. Do not silently save sensitive details.
 `.trim();
 }
 
 function SetupWizard({
   onComplete,
+  initialConfig,
+  onCancel,
 }: {
   onComplete: (config: LoaConfig) => void;
+  initialConfig?: LoaConfig;
+  onCancel?: () => void;
 }) {
   const [step, setStep] = useState(0);
-  const [draft, setDraft] = useState<LoaConfig>(DEFAULT_CONFIG);
+  const [draft, setDraft] = useState<LoaConfig>(
+    initialConfig ? { ...initialConfig } : DEFAULT_CONFIG
+  );
   const [testMessage, setTestMessage] = useState("");
+  const hermesTestRun = useRef(0);
+  useEffect(() => { hermesTestRun.current++; setTestMessage(""); }, [draft.hermesApiKey, draft.hermesUrl]);
 
   const canContinue =
     step === 0 ||
@@ -720,6 +762,7 @@ function SetupWizard({
   }
 
   async function testHermes() {
+    const run = ++hermesTestRun.current;
     setTestMessage("Testing Hermes...");
 
     try {
@@ -728,7 +771,7 @@ function SetupWizard({
         userName: draft.userName.trim() || "User",
         loaName: draft.loaName.trim() || "Loa",
         geminiVoice: normalizeGeminiVoice(draft.geminiVoice),
-        memoryMode: normalizeMemoryMode(draft.memoryMode),
+        memoryMode: "auto_basic",
       };
 
       const tempMemory = createDefaultMemory(tempConfig);
@@ -762,10 +805,10 @@ function SetupWizard({
         throw new Error(raw || `${res.status} ${res.statusText}`);
       }
 
-      setTestMessage("Hermes request accepted.");
+      if (run === hermesTestRun.current) setTestMessage("Hermes request accepted.");
     } catch (error) {
       console.error(error);
-      setTestMessage("Hermes test failed. You can fix it later.");
+      if (run === hermesTestRun.current) setTestMessage("Could not connect. Check that the Hermes gateway is running and your API key is correct.");
     }
   }
 
@@ -778,15 +821,17 @@ function SetupWizard({
       hermesApiKey: draft.hermesApiKey.trim(),
       geminiApiKey: draft.geminiApiKey.trim(),
       geminiVoice: normalizeGeminiVoice(draft.geminiVoice),
-      memoryMode: normalizeMemoryMode(draft.memoryMode),
+      memoryMode: "auto_basic",
     };
 
-    const freshMemory = createDefaultMemory(finalConfig);
+    const existingMemory = initialConfig
+      ? loadStoredMemory(finalConfig)
+      : createDefaultMemory(finalConfig);
     const existingMessagesRaw = localStorage.getItem(MESSAGES_KEY);
     const hasExistingMessages = Boolean(existingMessagesRaw);
 
     saveStoredConfig(finalConfig);
-    saveStoredMemory(freshMemory);
+    saveStoredMemory(existingMemory);
 
     if (!hasExistingMessages) {
       saveStoredMessages(createInitialMessages(finalConfig));
@@ -800,7 +845,13 @@ function SetupWizard({
       <section className="setupCard">
         <div className="setupHeader">
           <p className="microLabel">LOA SETUP</p>
-          <h1>{step === 0 ? "Welcome to Loa" : "First launch setup"}</h1>
+          <h1>
+            {initialConfig
+              ? "Loa settings"
+              : step === 0
+              ? "Welcome to Loa"
+              : "First launch setup"}
+          </h1>
           <p>
             {step === 0
               ? "Set up your screen-aware voice HUD."
@@ -869,6 +920,8 @@ function SetupWizard({
                 />
               </label>
 
+              <ConnectionTest apiKey={draft.geminiApiKey} voice={draft.geminiVoice} />
+
               <label className="fieldLabel">
                 Gemini Voice
                 <select
@@ -885,7 +938,7 @@ function SetupWizard({
                 </select>
               </label>
 
-              <p className="setupHint">You can change this later.</p>
+              
             </div>
           )}
 
@@ -912,11 +965,17 @@ function SetupWizard({
                 />
               </label>
 
-              <button className="secondaryButton setupTest" onClick={testHermes}>
-                Test Hermes
-              </button>
-
-              {testMessage && <p className="setupHint">{testMessage}</p>}
+              <div className="connectionTest">
+                <div className="connectionTestRow">
+                  {testMessage !== "Hermes request accepted." && <button type="button" className="connectionTestButton" disabled={testMessage === "Testing Hermes..."} onClick={testHermes}>
+                    {testMessage === "Testing Hermes..." ? "Testing…" : "Test connection"}<span aria-hidden="true">↗</span>
+                  </button>}
+                  <span role="status" title={testMessage === "Hermes request accepted." ? "Hermes accepted the test request." : undefined} className={"connectionBadge" + (testMessage === "Hermes request accepted." ? " isVerified" : "")}>
+                    {testMessage === "Testing Hermes..." ? "Connecting…" : testMessage === "Hermes request accepted." ? "✓ Connected" : testMessage ? "Could not connect" : ""}
+                  </span>
+                </div>
+                {testMessage && testMessage !== "Testing Hermes..." && testMessage !== "Hermes request accepted." && <p className="connectionError">{testMessage}</p>}
+              </div>
             </div>
           )}
 
@@ -939,21 +998,9 @@ function SetupWizard({
                 </select>
               </label>
 
-              <label className="fieldLabel">
-                Memory Mode
-                <select
-                  value={draft.memoryMode}
-                  onChange={(event) =>
-                    update("memoryMode", event.target.value as MemoryMode)
-                  }
-                >
-                  <option value="ask">Ask before saving</option>
-                  <option value="manual">Manual only</option>
-                  <option value="auto_basic">Auto-save basic preferences</option>
-                </select>
-              </label>
+              <div className="setupHint"><strong>Automatic memories</strong><p>Loa saves meaningful moments and context as you talk. You can review, edit, or delete them in Memories.</p></div>
 
-              <p className="setupHint">Recommended: Ask before saving.</p>
+              
             </div>
           )}
         </div>
@@ -961,8 +1008,14 @@ function SetupWizard({
         <div className="setupActions">
           <button
             className="secondaryButton"
-            onClick={() => setStep((prev) => Math.max(0, prev - 1))}
-            disabled={step === 0}
+            onClick={() => {
+              if (step === 0 && onCancel) {
+                onCancel();
+                return;
+              }
+              setStep((prev) => Math.max(0, prev - 1));
+            }}
+            disabled={step === 0 && !onCancel}
           >
             Back
           </button>
@@ -988,10 +1041,10 @@ function SetupWizard({
 
 function LoaHud({
   config,
-  onResetSetup,
+  onOpenSettings,
 }: {
   config: LoaConfig;
-  onResetSetup: () => void;
+  onOpenSettings: () => void;
 }) {
   const [memory, setMemory] = useState<LoaMemory>(() =>
     loadStoredMemory(config)
@@ -1000,9 +1053,22 @@ function LoaHud({
     useState<PendingMemoryProposal | null>(null);
   const pendingMemoryRef = useRef<PendingMemoryProposal | null>(null);
   const [showMemoryPanel, setShowMemoryPanel] = useState(false);
+  const [showNotebook, setShowNotebook] = useState(false);
+  useEffect(() => { if(showNotebook) { document.getElementById("loa-notebook")?.scrollIntoView({behavior:"smooth",block:"start"}); setShowNotebook(false); } }, [showNotebook]);
+  const [notebookTab, setNotebookTab] = useState<"memory" | "journal">("memory");
+  const [notice, setNotice] = useState("");
+  const journalRequestedRef = useRef(false);
+  const journalTextRef = useRef("");
+  const scheduledJournalDateRef = useRef<string | null>(null);
   const [liveViewOn, setLiveViewOn] = useState(false);
   const [liveSource, setLiveSource] = useState<LiveSource>("none");
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceLevel, setVoiceLevel] = useState(0);
+  useEffect(() => { const timer = window.setInterval(() => setVoiceLevel(audioPlayerRef.current?.getLevel() ?? 0), 50); return () => window.clearInterval(timer); }, []);
+  const [showHermesInfo, setShowHermesInfo] = useState(false);
+  const [hermesVerified, setHermesVerified] = useState(false);
+  useEffect(()=>setHermesVerified(false),[config.hermesApiKey,config.hermesUrl]);
+  useEffect(()=>{if(!showHermesInfo)return;const close=(e:KeyboardEvent)=>{if(e.key==="Escape")setShowHermesInfo(false);};window.addEventListener("keydown",close);return()=>window.removeEventListener("keydown",close);},[showHermesInfo]);
   const [hermesStatus, setHermesStatus] = useState<HermesStatus>("idle");
   const [geminiLiveStatus, setGeminiLiveStatus] =
     useState<GeminiLiveStatus>("disconnected");
@@ -1011,12 +1077,20 @@ function LoaHud({
   const [isSoftSleeping, setIsSoftSleeping] = useState(false);
   const [isWakeListenerOn, setIsWakeListenerOn] = useState(false);
   const [isVideoFrameStreaming, setIsVideoFrameStreaming] = useState(false);
-  const [viewStream, setViewStream] = useState<MediaStream | null>(null);
+  const [viewStream, setViewStreamState] = useState<MediaStream | null>(null);
+  const viewStreamRef=useRef<MediaStream|null>(null);
+  function setViewStream(value:MediaStream|null|((current:MediaStream|null)=>MediaStream|null)){const stream=typeof value==="function"?value(viewStreamRef.current):value;viewStreamRef.current=stream;setViewStreamState(stream);}
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState("");
+  const [chatText, setChatText] = useState("");
+  const [liveAttachments, setLiveAttachments] = useState<LiveAttachment[]>([]);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
+  const followChatRef = useRef(true);
+  const [showChatBottom, setShowChatBottom] = useState(false);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const liveFileInputRef = useRef<HTMLInputElement | null>(null);
   const speakingTimerRef = useRef<number | null>(null);
   const pollingTimerRef = useRef<number | null>(null);
   const keepAliveTimerRef = useRef<number | null>(null);
@@ -1025,6 +1099,8 @@ function LoaHud({
   const userEndedLiveRef = useRef(false);
   const shouldAutoReconnectRef = useRef(false);
   const reconnectAttemptRef = useRef(0);
+  const liveResumeRef = useRef<string | undefined>(undefined);
+  useEffect(()=>{liveResumeRef.current=undefined;},[config.geminiApiKey,config.geminiVoice,config.personalInstructions]);
   const wantedMicListeningRef = useRef(false);
   const wantedVideoStreamingRef = useRef(false);
   const desiredMicOnRef = useRef(false);
@@ -1044,23 +1120,44 @@ function LoaHud({
   const geminiUserTextFlushTimerRef = useRef<number | null>(null);
 
   const messagesRef = useRef<Message[]>(loadStoredMessages(config));
+  const memoryBaselineRef=useRef(messagesRef.current.filter(m=>m.role==="you").map(m=>m.at+":"+m.text).join("|"));
+  const memoryProcessedRef=useRef(messagesRef.current.at(-1));
+  const memoryBusyRef=useRef(false);
+  const memoryAbortRef=useRef<AbortController|null>(null);
+  const lastMemoryRunRef=useRef(0);
+  useEffect(()=>{
+    const onEdit=()=>{memoryProcessedRef.current=messagesRef.current.at(-1);memoryBaselineRef.current=messagesRef.current.filter(m=>m.role==="you").map(m=>m.at+":"+m.text).join("|");};
+    window.addEventListener("loa-notebook",onEdit);
+    return ()=>{window.removeEventListener("loa-notebook",onEdit);memoryAbortRef.current?.abort();};
+  },[]);
+  useEffect(()=>{
+    if(!config.geminiApiKey)return;
+    const timer=window.setInterval(()=>{
+      const current=messagesRef.current;
+      const signature=current.filter(m=>m.role==="you").map(m=>m.at+":"+m.text).join("|");
+      if(signature===memoryBaselineRef.current || memoryBusyRef.current || Date.now()-lastMemoryRunRef.current<45000)return;
+      if(current[current.length-1]?.role!=="loa")return;
+      memoryBusyRef.current=true;lastMemoryRunRef.current=Date.now();
+      const controller=new AbortController();memoryAbortRef.current=controller;
+      const timeout=window.setTimeout(()=>controller.abort(),30000);
+      window.dispatchEvent(new CustomEvent("loa-memory-status",{detail:"Organizing memories…"}));
+      const previous=memoryProcessedRef.current;
+      const anchor=previous ? current.findLastIndex(m=>m.role===previous.role && m.at===previous.at && m.text===previous.text) : -1;
+      const start=anchor+1;
+      organizeMemories(config.geminiApiKey,current.slice(start).slice(-24),controller.signal,current.slice(Math.max(0,start-24),start)).then(result=>{
+        const {applied,created,updated}=result;
+        if(applied){memoryBaselineRef.current=signature;memoryProcessedRef.current=current.at(-1);}
+        window.dispatchEvent(new CustomEvent("loa-memory-status",{detail:applied?("Memory review: "+created+" new, "+updated+" updated."):"Memory changed during review. Previous results were discarded."}));
+      }).catch((error)=>{const message=controller.signal.aborted?"Memory review timed out or was cancelled.":error instanceof Error?error.message:"Memory review failed.";window.dispatchEvent(new CustomEvent("loa-memory-status",{detail:message}));})
+      .finally(()=>{clearTimeout(timeout);memoryBusyRef.current=false;});
+    },12000);
+    return ()=>{clearInterval(timer);memoryAbortRef.current?.abort();};
+  },[config.geminiApiKey]);
+
   const [messages, setMessages] = useState<Message[]>(messagesRef.current);
 
   useEffect(() => {
-    navigator.mediaDevices
-      .enumerateDevices()
-      .then((devices) => {
-        const cameras = devices.filter((device) => device.kind === "videoinput");
-        setVideoDevices(cameras);
-        setSelectedVideoDeviceId((current) => {
-          if (current) return current;
-          return (
-            cameras.find((device) => device.label.toLowerCase().includes("obs"))
-              ?.deviceId || cameras[0]?.deviceId || ""
-          );
-        });
-      })
-      .catch((error) => console.error("Could not read video devices.", error));
+    refreshVideoDevices();
   }, []);
 
   useEffect(() => {
@@ -1080,10 +1177,13 @@ function LoaHud({
   }, [isVideoFrameStreaming]);
 
   useEffect(() => {
-    messageListRef.current?.scrollTo({
-      top: messageListRef.current.scrollHeight,
-      behavior: "smooth",
-    });
+    const list=messageListRef.current;if(!list)return;
+    const bottom=()=>{if(followChatRef.current) { list.scrollTop=list.scrollHeight; setShowChatBottom(false); } else setShowChatBottom(list.scrollHeight-list.scrollTop-list.clientHeight > 160);};
+    const frame=requestAnimationFrame(bottom);
+    // Persisted images load after the first layout.
+    const loaded=()=>{requestAnimationFrame(bottom);};
+    list.addEventListener("load",loaded,true);
+    return ()=>{cancelAnimationFrame(frame);list.removeEventListener("load",loaded,true);};
   }, [messages]);
 
   useEffect(() => {
@@ -1160,7 +1260,7 @@ function LoaHud({
 
   function setAndSaveMessages(updater: (current: Message[]) => Message[]) {
     setMessages((current) => {
-      const next = updater(current).slice(-300);
+      const next = updater(current).slice(-300).map(m => m.at ? m : { ...m, at: new Date().toISOString() });
       messagesRef.current = next;
       saveStoredMessages(next);
       return next;
@@ -1194,6 +1294,104 @@ function LoaHud({
   function pushLoaMessage(text: string) {
     setAndSaveMessages((prev) => [...prev, { role: "loa", text }]);
     triggerSpeaking();
+  }
+
+  async function addLiveFiles(files: FileList | File[]) {
+    const slots = Math.max(0, 10 - liveAttachments.length);
+    if (files.length > slots) setNotice("Up to 10 attachments per message. Remove an attachment to add more.");
+    const accepted = Array.from(files).slice(0, slots);
+    const next = await Promise.all(accepted.map(async (file): Promise<LiveAttachment> => {
+      const isImage = file.type.startsWith("image/");
+      const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+      const isText = file.type.startsWith("text/") || /\.(txt|md|json|csv|tsv|js|jsx|ts|tsx|css|html|xml|yaml|yml|py|java|c|cpp|h|hpp|rs|go|sql|sh|ps1)$/i.test(file.name);
+      if (!isImage && !isPdf && !isText) throw new Error(`${file.name} is not supported. Attach an image, PDF, or text/code file.`);
+      if (isImage && file.size > 10 * 1024 * 1024) throw new Error(`${file.name} is larger than 10 MB.`);
+      if (isPdf && file.size > 20 * 1024 * 1024) throw new Error(`${file.name} is larger than 20 MB.`);
+      if (isText && file.size > 2 * 1024 * 1024) throw new Error(`${file.name} is larger than 2 MB.`);
+      if (isImage) {
+        const dataUrl = await readFileAsDataUrl(file);
+        return { id: makeId("live-file"), name: file.name, kind: "image", mimeType: file.type || "image/jpeg", base64Data: dataUrlPayload(dataUrl) };
+      }
+      if (isPdf) {
+        const textContent = await extractPdfText(file);
+        if (!textContent) throw new Error(`${file.name} has no extractable text. Scanned PDFs need OCR before Loa can read them.`);
+        return { id: makeId("live-file"), name: file.name, kind: "pdf", mimeType: "application/pdf", textContent };
+      }
+      return { id: makeId("live-file"), name: file.name, kind: "text", mimeType: file.type || "text/plain", textContent: await file.text() };
+    }));
+    setLiveAttachments((current) => [...current, ...next].slice(0, 10));
+    window.requestAnimationFrame(() => chatInputRef.current?.focus());
+  }
+
+  function removeLiveAttachment(id: string) {
+    setLiveAttachments((current) => current.filter((attachment) => attachment.id !== id));
+  }
+
+  const sendingChatRef = useRef(false);
+  const imageHoldRef = useRef(0);
+  const lastConversationRef = useRef(Date.now());
+  const lastProactiveRef = useRef(Date.now());
+  const proactiveModeRef = useRef(config.proactiveMode || "occasional");
+  useEffect(()=>{proactiveModeRef.current=config.proactiveMode || "occasional";},[config.proactiveMode]);
+
+
+  async function sendLiveChat() {
+    if (sendingChatRef.current) return;
+    const text = chatText.trim();
+    if (!text && liveAttachments.length === 0) return;
+    const client = geminiLiveClientRef.current;
+    if (geminiLiveStatus !== "connected" || !client?.isConnected()) {
+      pushLoaMessage("Connect Gemini Live before sending chat or files.");
+      return;
+    }
+    sendingChatRef.current = true;
+    try {
+    const images = liveAttachments.filter(a => a.kind === "image" && a.base64Data);
+    const savedImages = await saveChatImages(images);
+    if(images.length) {
+      try {
+        imageHoldRef.current = Date.now() + 60000;
+        client.sendText("Receiving "+images.length+" separate numbered photos. Wait silently until PHOTO_BATCH_COMPLETE before answering.");
+        for (const [index, attachment] of images.entries()) {
+          await new Promise(resolve => window.setTimeout(resolve, 1100));
+          if(geminiLiveClientRef.current !== client || !client.isConnected()) throw Error("Live disconnected. Reconnect and send again.");
+          const image = new Image();
+          image.src = 'data:'+attachment.mimeType+';base64,'+attachment.base64Data;
+          await image.decode();
+          const scale=Math.min(1,1280/Math.max(image.width,image.height));
+          const canvas=document.createElement("canvas");
+          canvas.width=Math.max(320,Math.round(image.width*scale));canvas.height=Math.round(image.height*scale)+48;
+          const ctx=canvas.getContext("2d");if(!ctx)throw Error("Image preparation unavailable.");
+          ctx.fillStyle="#fff";ctx.fillRect(0,0,canvas.width,canvas.height);
+          ctx.fillStyle="#222";ctx.font="24px sans-serif";ctx.fillText("Photo "+(index+1)+" of "+images.length,16,32);
+          ctx.drawImage(image,0,48,image.width*scale,image.height*scale);
+          client.sendVideoFrame(canvas.toDataURL("image/jpeg",.9).split(",")[1],"image/jpeg");
+        }
+        imageHoldRef.current=Date.now()+30000;
+      } catch(error) { setNotice(error instanceof Error ? error.message : 'Could not prepare images.'); return; }
+    }
+    const documentText = liveAttachments
+      .filter((attachment) => attachment.textContent)
+      .map((attachment) => `[BEGIN ATTACHMENT: ${attachment.name}]\n${attachment.textContent}\n[END ATTACHMENT: ${attachment.name}]`)
+      .join("\n\n")
+      .slice(0, 160000);
+    const imageNames = liveAttachments.filter((attachment) => attachment.kind === "image").map((attachment, index) => `Image ${index+1}: ${attachment.name}`);
+    const prompt = [
+      text || "Read the attached files and respond to their contents.",
+      documentText ? `ATTACHED DOCUMENTS — use these as the primary source. Do not invent missing details.\n\n${documentText}` : "",
+      imageNames.length > 0 ? `PHOTO_BATCH_COMPLETE. All photos have been sent separately in numbered order. Refer to first, second, third using the Photo N labels. Consider all photos, not just the latest frame. Be honest if any image is missing. Image names: ${imageNames.join(", ")}.` : "",
+    ].filter(Boolean).join("\n\n");
+    const display = `${text || "Read the attached files."}${liveAttachments.length > 0 ? `\nAttached: ${liveAttachments.map((attachment) => attachment.name).join(", ")}` : ""}`;
+    setAndSaveMessages(current => [...current, {role:"you", text:display, images:savedImages}]);
+    lastConversationRef.current=Date.now();
+    client.sendText(prompt);
+    setChatText(current => current === chatText ? "" : current);
+    const sentIds = new Set(liveAttachments.map(attachment => attachment.id));
+    setLiveAttachments(current => current.filter(attachment => !sentIds.has(attachment.id)));
+    window.requestAnimationFrame(() => chatInputRef.current?.focus());
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not send. Please try again.");
+    } finally { sendingChatRef.current = false; }
   }
 
   function clearChatHistory() {
@@ -1250,6 +1448,7 @@ function LoaHud({
 
     timerRef.current = window.setTimeout(() => {
       const finalText = bufferRef.current.trim();
+      if (role === "loa" && ((finalText.includes("LOA_MEMORY_PROPOSAL]") && !finalText.includes("[/LOA_MEMORY_PROPOSAL]")) || (finalText.includes("[LOA_COMMAND]") && !finalText.includes("[/LOA_COMMAND]")))) return;
 
       if (finalText && !finalText.startsWith("[LOA_KEEPALIVE]")) {
         if (role === "you") {
@@ -1268,10 +1467,7 @@ function LoaHud({
             memoryExtraction.visibleText
           );
 
-          if (memoryExtraction.proposal && config.memoryMode !== "manual") {
-            pendingMemoryRef.current = memoryExtraction.proposal;
-            setPendingMemory(memoryExtraction.proposal);
-          }
+          if (memoryExtraction.proposal) saveMemoryProposal(memoryExtraction.proposal);
 
           if (commandExtraction.visibleText) {
             setAndSaveMessages((prev) => [
@@ -1357,7 +1553,7 @@ function LoaHud({
   }
 
   function scheduleGeminiReconnect(reason = "Gemini Live disconnected.") {
-    clearGeminiReconnectTimer();
+    if (reconnectTimerRef.current) return;
 
     if (!shouldAutoReconnectRef.current || userEndedLiveRef.current) {
       return;
@@ -1366,15 +1562,17 @@ function LoaHud({
     reconnectAttemptRef.current += 1;
 
     const attempt = reconnectAttemptRef.current;
+    if (attempt > 5) { shouldAutoReconnectRef.current = false; setGeminiLiveStatus("error"); setNotice("Connection could not be restored. Check your network and API key, then connect again."); return; }
     const delay = Math.min(1200 + attempt * 600, 5000);
 
     setGeminiLiveStatus("connecting");
 
     if (attempt === 1) {
-      pushLoaMessage("Live slipped offline. Reconnecting quietly.");
+      setNotice("Live slipped offline. Reconnecting quietly.");
     }
 
     reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
       if (!shouldAutoReconnectRef.current || userEndedLiveRef.current) {
         return;
       }
@@ -1405,53 +1603,24 @@ function LoaHud({
     }
   }
 
+  useEffect(() => {
+    if (geminiLiveStatus !== "connected") return;
+    const check = () => {
+      const now = new Date();
+      const day = [now.getFullYear(),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0')].join('-');
+      if (now.getHours() !== 23 || now.getMinutes() < 50 || localStorage.getItem('loa-journal-day') === day || journalRequestedRef.current) return;
+      if (!messagesRef.current.some(m => m.role === 'you' && m.at && new Date(m.at).toDateString() === now.toDateString())) return;
+      journalRequestedRef.current = true; journalTextRef.current = ''; scheduledJournalDateRef.current = day;
+      geminiLiveClientRef.current?.sendText("Write today's journal from our actual conversations, preserving events, context, significance and explicitly stated feelings. Use the user's conversation language. Do not invent missing details. Do not include command or memory tags.");
+      setNotice("Loa is writing today's journal.");
+    };
+    const timer = window.setInterval(check, 15000); check();
+    return () => window.clearInterval(timer);
+  }, [geminiLiveStatus]);
+
   function saveMemoryProposal(proposal: PendingMemoryProposal) {
-    updateMemory((current) => {
-      const next: LoaMemory = {
-        ...current,
-        sessionMemory: {
-          ...current.sessionMemory,
-          recentEvents: [
-            `Memory saved: ${proposal.title}`,
-            ...current.sessionMemory.recentEvents.slice(0, 9),
-          ],
-        },
-      };
-
-      if (proposal.category === "preference") {
-        next.userMemory = {
-          ...next.userMemory,
-          preferences: addUniqueItem(next.userMemory.preferences, proposal.text),
-        };
-      }
-
-      if (proposal.category === "project") {
-        next.userMemory = {
-          ...next.userMemory,
-          projects: addUniqueItem(next.userMemory.projects, proposal.text),
-        };
-      }
-
-      if (proposal.category === "workStyle") {
-        next.userMemory = {
-          ...next.userMemory,
-          workStyle: addUniqueItem(next.userMemory.workStyle, proposal.text),
-        };
-      }
-
-      if (proposal.category === "session") {
-        next.sessionMemory = {
-          ...next.sessionMemory,
-          recentEvents: addUniqueItem(next.sessionMemory.recentEvents, proposal.text),
-        };
-      }
-
-      return next;
-    });
-
-    pendingMemoryRef.current = null;
-    setPendingMemory(null);
-    pushLoaMessage("기억해둘게.");
+    recordMemory(proposal.title, proposal.text);
+    pendingMemoryRef.current = null; setPendingMemory(null); setNotice("Memory saved to your notebook.");
   }
 
   function approveMemorySave() {
@@ -1465,7 +1634,7 @@ function LoaHud({
   function rejectMemorySave() {
     pendingMemoryRef.current = null;
     setPendingMemory(null);
-    pushLoaMessage("알겠어. 그건 기억하지 않을게.");
+    pushLoaMessage("Okay. I will not save that memory.");
   }
 
   function handleMemoryApprovalFromUser(text: string) {
@@ -1489,33 +1658,16 @@ function LoaHud({
   }
 
   function getMemoryItemsForCommand() {
-    return [
-      ...memory.userMemory.preferences.map((text) => ({
-        category: "preference" as MemoryCategory,
-        text,
-      })),
-      ...memory.userMemory.projects.map((text) => ({
-        category: "project" as MemoryCategory,
-        text,
-      })),
-      ...memory.userMemory.workStyle.map((text) => ({
-        category: "workStyle" as MemoryCategory,
-        text,
-      })),
-      ...memory.sessionMemory.recentEvents.map((text) => ({
-        category: "session" as MemoryCategory,
-        text,
-      })),
-    ];
+    return readNotebook().entries.filter(e => e.kind === "memory").map(e => ({category: "session" as MemoryCategory, text:e.text}));
   }
 
   function showMemoryByConversation() {
-    setShowMemoryPanel(true);
+    setShowNotebook(true);
 
     const items = getMemoryItemsForCommand();
 
     if (items.length === 0) {
-      pushLoaMessage("아직 저장된 메모리는 없어.");
+      pushLoaMessage("No memories saved yet.");
       return;
     }
 
@@ -1535,14 +1687,17 @@ function LoaHud({
       })
       .join("\\n");
 
-    pushLoaMessage(`지금 메모리에 이런 것들이 저장돼 있어.\\n${summary}`);
+    pushLoaMessage(`Here are your saved memories.\\n${summary}`);
   }
 
   function deleteMemoryByQuery(query: string) {
+    const notebook = readNotebook();
+    const needle = query.trim().toLowerCase();
+    if (needle) saveNotebook({...notebook, entries: notebook.entries.filter(e => !e.text.toLowerCase().includes(needle) && !e.title.toLowerCase().includes(needle))});
     const normalizedQuery = query.trim().toLowerCase();
 
     if (!normalizedQuery) {
-      pushLoaMessage("어떤 메모리를 지울지 다시 말해줘.");
+      pushLoaMessage("Tell me which memory to delete.");
       return;
     }
 
@@ -1608,11 +1763,11 @@ function LoaHud({
     });
 
     if (removedText) {
-      pushLoaMessage(`지웠어: ${removedText}`);
+      pushLoaMessage(`Deleted: ${removedText}`);
       return;
     }
 
-    pushLoaMessage("그 표현과 맞는 메모리를 못 찾았어. 메모리 목록을 열어볼게.");
+    pushLoaMessage("No matching memory found. Opening your memories.");
     setShowMemoryPanel(true);
   }
 
@@ -1654,9 +1809,9 @@ function LoaHud({
       return;
     }
 
-    if (!videoRef.current || !viewStream) {
+    if (!videoRef.current || !viewStreamRef.current?.getVideoTracks().some(track=>track.readyState==="live")) {
       if (showMessage) {
-        pushLoaMessage("No live video source is active.");
+        setNotice("Choose a screen or camera to share first.");
       }
       return;
     }
@@ -1667,8 +1822,15 @@ function LoaHud({
     }
 
     videoFrameCaptureRef.current = new VideoFrameCapture(
-      (base64Jpeg) => {
+      (base64Jpeg, changed) => {
+        const now=Date.now();
+        if(sendingChatRef.current || now<imageHoldRef.current)return;
         geminiLiveClientRef.current?.sendVideoFrame(base64Jpeg);
+        const mode=proactiveModeRef.current;
+        if(changed && mode!=="off" && !isSoftSleepingRef.current && now-lastConversationRef.current>8000 && now-lastProactiveRef.current>(mode==="active"?30000:90000)){
+          lastProactiveRef.current=now;
+          geminiLiveClientRef.current?.sendText("[SCREEN OBSERVATION] The shared screen changed. If there is a meaningful new event worth mentioning, make one brief natural comment in the user's current language. Otherwise stay silent. Do not narrate routine movement, repeat observations, invent details, or ask questions just to fill silence.");
+        }
       },
       {
         intervalMs: 1000,
@@ -1681,7 +1843,7 @@ function LoaHud({
     setIsVideoFrameStreaming(true);
 
     if (showMessage) {
-      pushLoaMessage("Screen frames connected.");
+      setNotice("Screen frames are being sent to Loa.");
     }
   }
 
@@ -1810,7 +1972,7 @@ function LoaHud({
       setIsWakeListenerOn(true);
 
       if (showMessage) {
-        pushLoaMessage("Sleep. Say “Hey Loa” or “로아야” to wake me.");
+        pushLoaMessage("Sleeping. Say “Hey Loa” to wake me.");
       }
     } catch (error) {
       console.error("Wake listener failed:", error);
@@ -1848,7 +2010,7 @@ function LoaHud({
     );
 
     if (showMessage) {
-      pushLoaMessage("Quiet mode. 마이크는 유지할게. 게임 중엔 연결 안 끊기게 조용히 있을게.");
+      pushLoaMessage("Quiet mode. The microphone stays connected.");
     }
   }
 
@@ -1867,7 +2029,7 @@ function LoaHud({
     );
 
     if (showMessage) {
-      pushLoaMessage("응, 다시 말할게.");
+      pushLoaMessage("I am listening again.");
     }
   }
 
@@ -1891,6 +2053,14 @@ function LoaHud({
     }
 
     microphoneCaptureRef.current = new MicrophoneCapture((base64Audio) => {
+      const bytes=atob(base64Audio);
+      let energy=0;
+      for(let i=0;i+1<bytes.length;i+=2){
+        let sample=bytes.charCodeAt(i)|(bytes.charCodeAt(i+1)<<8);
+        if(sample>32767)sample-=65536;
+        energy+=(sample/32768)**2;
+      }
+      if(Math.sqrt(energy/Math.max(1,bytes.length/2))>0.015)lastConversationRef.current=Date.now();
       geminiLiveClientRef.current?.sendAudioChunk(base64Audio);
     });
 
@@ -1946,18 +2116,7 @@ function LoaHud({
 
       setVideoDevices(cameras);
 
-      const obsDevice = cameras.find((device) =>
-        device.label.toLowerCase().includes("obs")
-      );
-
-      if (obsDevice) {
-        setSelectedVideoDeviceId(obsDevice.deviceId);
-        return;
-      }
-
-      if (!selectedVideoDeviceId && cameras[0]) {
-        setSelectedVideoDeviceId(cameras[0].deviceId);
-      }
+      setSelectedVideoDeviceId(current => cameras.some(camera => camera.deviceId === current) ? current : "");
     } catch (error) {
       console.error(error);
       pushLoaMessage("Could not read video devices.");
@@ -2023,14 +2182,9 @@ function LoaHud({
         },
       }));
 
-      pushUserMessage(`${config.loaName}, start screen view.`);
-      pushLoaMessage("Screen view connected.");
+      setNotice("Screen sharing started.");
 
-      if (geminiLiveClientRef.current?.isConnected()) {
-        window.setTimeout(() => {
-          startVideoFrameStreaming(true);
-        }, 700);
-      }
+      // The viewStream effect starts frames after React attaches the new video.
     } catch (error) {
       console.error(error);
       pushLoaMessage("Screen share permission was cancelled.");
@@ -2044,15 +2198,6 @@ function LoaHud({
 
       let deviceId = selectedVideoDeviceId;
 
-      if (!deviceId) {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const cameras = devices.filter((device) => device.kind === "videoinput");
-        const obsDevice = cameras.find((device) =>
-          device.label.toLowerCase().includes("obs")
-        );
-
-        deviceId = obsDevice?.deviceId || cameras[0]?.deviceId || "";
-      }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: deviceId
@@ -2085,7 +2230,7 @@ function LoaHud({
         }));
 
         clearGeminiTextBuffers();
-        pushLoaMessage("OBS view stopped.");
+        pushLoaMessage("Camera view stopped.");
       });
 
       desiredVideoOnRef.current = true;
@@ -2117,14 +2262,9 @@ function LoaHud({
         },
       }));
 
-      pushUserMessage(`${config.loaName}, connect OBS camera.`);
-      pushLoaMessage(`Camera source connected: ${label}`);
+      setNotice(`Camera connected: ${label}`);
 
-      if (geminiLiveClientRef.current?.isConnected()) {
-        window.setTimeout(() => {
-          startVideoFrameStreaming(true);
-        }, 700);
-      }
+      // The viewStream effect starts frames after React attaches the new video.
     } catch (error) {
       console.error(error);
       pushLoaMessage("Camera source permission was cancelled or failed.");
@@ -2154,14 +2294,9 @@ function LoaHud({
     pushLoaMessage("Live view stopped.");
   }
 
-  async function stopAllSharing() {
-    await stopLiveView();
-    await disconnectGeminiLiveShell();
-    pushLoaMessage("Privacy stop complete. Camera, screen, and microphone sharing are off.");
-  }
-
   function connectGeminiLiveShell(isReconnectArg: boolean | unknown = false) {
     const isReconnect = isReconnectArg === true;
+    if (!isReconnect && geminiLiveClientRef.current?.isActive()) return;
 
     if (!config.geminiApiKey.trim()) {
       setGeminiLiveStatus("error");
@@ -2172,12 +2307,14 @@ function LoaHud({
     clearGeminiReconnectTimer();
     stopGeminiKeepAlive();
 
+    if (!isReconnect) { reconnectAttemptRef.current = 0; liveResumeRef.current=undefined; }
     userEndedLiveRef.current = false;
     shouldAutoReconnectRef.current = true;
     desiredMicOnRef.current = useMicInput;
     desiredVideoOnRef.current = Boolean(viewStream);
     startLiveWatchdog();
 
+    audioPlayerRef.current?.stop();
     geminiLiveClientRef.current?.disconnect();
     geminiLiveClientRef.current = null;
 
@@ -2214,15 +2351,36 @@ function LoaHud({
 
     if (!isReconnect) {
       pushUserMessage(`${config.loaName}, connect live.`);
-      pushLoaMessage("Connecting to Gemini Live.");
+      setNotice("Connecting to Gemini Live.");
     }
 
     const client = new GeminiLiveClient({
       apiKey: config.geminiApiKey,
       voiceName: config.geminiVoice,
       systemInstruction: systemPrompt,
+      resumptionHandle: isReconnect ? liveResumeRef.current : undefined,
+      onMessage: (message: any) => {
+        if(geminiLiveClientRef.current !== client)return;
+        const resume=message.sessionResumptionUpdate;
+        if(resume){
+          liveResumeRef.current=resume.resumable && typeof resume.newHandle==="string" ? resume.newHandle : undefined;
+        }
+        if(message.goAway && !userEndedLiveRef.current && shouldAutoReconnectRef.current){
+          setNotice("Refreshing the Live connection. Keeping your conversation.");
+          client.disconnect();
+          connectGeminiLiveShell(true);
+          return;
+        }
+        if (message?.serverContent?.interrupted) { audioPlayerRef.current?.stop(); journalRequestedRef.current = false; journalTextRef.current = ""; }
+        if (message?.serverContent?.turnComplete && journalRequestedRef.current) {
+          if (journalTextRef.current.trim()) { recordJournal(journalTextRef.current.trim()); if(scheduledJournalDateRef.current) localStorage.setItem("loa-journal-day",scheduledJournalDateRef.current); }
+          scheduledJournalDateRef.current = null;
+          journalRequestedRef.current = false; journalTextRef.current = "";
+          setNotice("Journal draft saved. Review it in Memories & journal.");
+        }
+      },
       onOpen: () => {
-        pushLoaMessage("Gemini Live socket opened. Sending setup.");
+        setNotice("Gemini Live socket opened. Sending setup.");
       },
       onSetupComplete: () => {
         reconnectAttemptRef.current = 0;
@@ -2242,7 +2400,7 @@ function LoaHud({
           },
         }));
 
-        pushLoaMessage(isReconnect ? "Live reconnected." : "Gemini Live connected.");
+        setNotice(isReconnect ? "Live reconnected." : "Gemini Live connected.");
 
         if (!isReconnect) {
           client.sendText(
@@ -2256,9 +2414,10 @@ function LoaHud({
 
         if (shouldRestoreMic) {
           window.setTimeout(() => {
+            if (geminiLiveClientRef.current !== client || userEndedLiveRef.current) return;
             startMicrophoneCapture(false).then(() => {
               if (!isReconnect) {
-                pushLoaMessage("Microphone connected.");
+                setNotice("Microphone connected.");
               }
             });
           }, isReconnect ? 700 : 1800);
@@ -2266,6 +2425,7 @@ function LoaHud({
 
         if (shouldRestoreVideo) {
           window.setTimeout(() => {
+            if (geminiLiveClientRef.current !== client || userEndedLiveRef.current) return;
             startVideoFrameStreaming(!isReconnect);
           }, isReconnect ? 700 : 900);
         }
@@ -2275,14 +2435,18 @@ function LoaHud({
         pushStreamingTextChunk("loa", text);
       },
       onInputText: (text) => {
+        lastConversationRef.current=Date.now();
         if (text.includes("[LOA_KEEPALIVE]")) return;
         pushStreamingTextChunk("you", text);
       },
       onOutputText: (text) => {
+        if (journalRequestedRef.current) journalTextRef.current += text;
         if (text.includes("[LOA_KEEPALIVE]")) return;
         pushStreamingTextChunk("loa", text);
       },
       onAudioChunk: (chunk) => {
+        if(userEndedLiveRef.current || geminiLiveClientRef.current!==client)return;
+        lastConversationRef.current=Math.max(Date.now(),lastConversationRef.current)+Math.ceil(chunk.length*0.75/48);
         audioPlayerRef.current?.playBase64Pcm24k(chunk).catch((error) => {
           console.error("Gemini audio playback failed:", error);
           pushLoaMessage("Gemini audio playback failed.");
@@ -2303,7 +2467,17 @@ function LoaHud({
         setGeminiLiveStatus("error");
         pushLoaMessage(message);
       },
-      onClose: () => {
+      onClose: (code, reason) => {
+        if(geminiLiveClientRef.current!==client)return;
+        audioPlayerRef.current?.stop();
+        journalRequestedRef.current = false; journalTextRef.current = "";
+        const sessionExpired=/goaway|session duration|session.*expir/i.test(reason);
+        const rejectedResume=!!liveResumeRef.current && /resum|handle/i.test(reason);
+        if(rejectedResume)liveResumeRef.current=undefined;
+        if ([1008, 1003, 1007].includes(code) && !sessionExpired && !rejectedResume) {
+          shouldAutoReconnectRef.current = false;
+          setNotice(`Live connection rejected (${code}). Check the model and API key in Settings. ${reason.slice(0, 120)}`);
+        }
         stopWakeWordListener();
         stopGeminiKeepAlive();
 
@@ -2323,7 +2497,7 @@ function LoaHud({
         }
 
         setGeminiLiveStatus("disconnected");
-        pushLoaMessage("Gemini Live disconnected.");
+        setNotice("Live ended ("+code+"): "+(reason ? reason.split(config.geminiApiKey).join("[redacted]").slice(0,200) : "No reason was supplied by the server.")+" Select Start Loa to reconnect.");
       },
     });
 
@@ -2332,6 +2506,7 @@ function LoaHud({
   }
 
   async function disconnectGeminiLiveShell() {
+    journalRequestedRef.current = false; journalTextRef.current = "";
     userEndedLiveRef.current = true;
     shouldAutoReconnectRef.current = false;
     reconnectAttemptRef.current = 0;
@@ -2344,12 +2519,12 @@ function LoaHud({
     stopLiveWatchdog();
     stopGeminiKeepAlive();
 
-    await stopMicrophoneCapture(false, false, false);
-
+    // Silence playback and detach the socket before asynchronous microphone cleanup.
+    audioPlayerRef.current?.stop();
     geminiLiveClientRef.current?.disconnect();
     geminiLiveClientRef.current = null;
-
-    audioPlayerRef.current?.stop();
+    stopVideoFrameStreaming();
+    await stopMicrophoneCapture(false, false, false);
 
     clearGeminiTextBuffers();
     setGeminiLiveStatus("disconnected");
@@ -2358,12 +2533,17 @@ function LoaHud({
     pushLoaMessage("Live ended. Chat history is saved.");
   }
 
-  async function sleepMic() {
-    enterSoftSleep(true);
-  }
+  async function toggleMicrophone() {
+    if (microphoneCaptureRef.current || isMicListening) {
+      setUseMicInput(false);
+      setIsSoftSleeping(false);
+      isSoftSleepingRef.current = false;
+      await stopMicrophoneCapture(false, false, false);
+      pushLoaMessage("Microphone off.");
+      return;
+    }
 
-  async function wakeMic() {
-    exitSoftSleep(true);
+    setUseMicInput(true);
     await startMicrophoneCapture(true);
   }
 
@@ -2442,9 +2622,11 @@ function LoaHud({
         return;
       }
 
+      setHermesVerified(true);
       setHermesStatus("running");
     } catch (error) {
       clearPolling();
+      setHermesVerified(false);
       setHermesStatus("error");
       pushLoaMessage("Hermes polling failed.");
       console.error(error);
@@ -2455,7 +2637,7 @@ function LoaHud({
     const trimmedTask = userTask.trim();
 
     if (!trimmedTask) {
-      pushLoaMessage("검색할 내용을 다시 말해줘.");
+      pushLoaMessage("What would you like to search for?");
       return;
     }
 
@@ -2481,7 +2663,7 @@ function LoaHud({
     clearPolling();
     setHermesStatus("starting");
 
-    pushLoaMessage("Hermes로 찾아볼게.");
+    pushLoaMessage("I will ask Hermes to search.");
 
     try {
       const res = await fetch("/hermes/v1/runs", {
@@ -2509,8 +2691,9 @@ function LoaHud({
         throw new Error(`Hermes did not return run_id: ${raw}`);
       }
 
+      setHermesVerified(true);
       setHermesStatus("running");
-      pushLoaMessage("Hermes가 검색 중이야.");
+      pushLoaMessage("Hermes is searching.");
 
       await pollHermesRun(data.run_id);
 
@@ -2519,8 +2702,9 @@ function LoaHud({
       }, 1200);
     } catch (error) {
       clearPolling();
+      setHermesVerified(false);
       setHermesStatus("error");
-      pushLoaMessage("Hermes 검색이 막혔어. Hermes gateway/API 설정을 확인해야 해.");
+      pushLoaMessage("Hermes search is unavailable. Check the gateway and API settings.");
       console.error(error);
     }
   }
@@ -2575,6 +2759,7 @@ function LoaHud({
         throw new Error(`Hermes did not return run_id: ${raw}`);
       }
 
+      setHermesVerified(true);
       setHermesStatus("running");
       pushLoaMessage("Hermes is running.");
 
@@ -2585,13 +2770,14 @@ function LoaHud({
       }, 1200);
     } catch (error) {
       clearPolling();
+      setHermesVerified(false);
       setHermesStatus("error");
       pushLoaMessage("Hermes blocked.");
       console.error(error);
     }
   }
 
-  function resetSetup() {
+  function openSettings() {
     userEndedLiveRef.current = true;
     shouldAutoReconnectRef.current = false;
     clearGeminiReconnectTimer();
@@ -2599,11 +2785,7 @@ function LoaHud({
     stopWakeWordListener();
     setIsSoftSleeping(false);
     isSoftSleepingRef.current = false;
-
-    localStorage.removeItem(CONFIG_KEY);
-    localStorage.removeItem(MEMORY_KEY);
-    localStorage.removeItem(MESSAGES_KEY);
-    onResetSetup();
+    onOpenSettings();
   }
 
   function getLoaStateText() {
@@ -2645,31 +2827,28 @@ function LoaHud({
   const liveBadgeText =
     liveSource === "screen" ? "SCREEN" : liveSource === "camera" ? "OBS" : "OFF";
 
-  const hermesButtonText =
-    hermesStatus === "starting"
-      ? "Connecting..."
-      : hermesStatus === "running"
-      ? "Hermes Running"
-      : "Test Hermes";
+  const hermesConnectionLabel = hermesStatus === "starting" || hermesStatus === "running" ? "Working" : hermesStatus === "error" || hermesStatus === "failed" ? "Check connection" : hermesVerified ? "Connected" : "Not checked";
+  const hermesButtonText = "Hermes · " + hermesConnectionLabel;
 
   const micButtonText =
     geminiLiveStatus === "connected"
-      ? isSoftSleeping
-        ? "Wake"
-        : isMicListening
-        ? "Quiet"
-        : "Wake"
+      ? isMicListening
+        ? "Mute"
+        : "Unmute"
       : "Mic";
-
-  const memoryLabel =
-    config.memoryMode === "ask"
-      ? "ASK"
-      : config.memoryMode === "manual"
-      ? "MANUAL"
-      : "BASIC";
 
   return (
     <main className="page">
+      {showHermesInfo && <div className="notebookBackdrop" onClick={e=>{if(e.target===e.currentTarget)setShowHermesInfo(false);}}><section className="notebook hermesInfo" role="dialog" aria-modal="true" aria-label="Hermes connection">
+        <header><h2>Hermes</h2><button className="notebookClose" autoFocus onClick={()=>setShowHermesInfo(false)} aria-label="Close Hermes information">×</button></header>
+        <p className="hermesConnectionState" role="status">{hermesConnectionLabel}</p>
+        <p>Hermes helps Loa with searches and background tasks. Ask Loa naturally when you need help.</p>
+        <p className="notebookIntro">Run the Hermes gateway on your computer first. This button does not start the gateway.</p>
+        {hermesVerified && <p className="notebookIntro">Your last request was accepted. This is not continuous connection monitoring.</p>}
+        <button className="connectionTestButton" onClick={()=>void runHermesSearch()} disabled={hermesStatus==="starting" || hermesStatus==="running"}>{hermesStatus==="starting" || hermesStatus==="running" ? "Testing…" : "Test connection"}</button>
+        <p className="notebookIntro">Sends a short test task. The result appears in chat and may use API credits.</p>
+      </section></div>}
+
       <div className="appShell">
         <header className="topBar">
           <div className="brand">
@@ -2686,19 +2865,24 @@ function LoaHud({
               {liveViewOn ? loaStateText : "Live view off"}
             </button>
 
-            <button className="settingsButton" onClick={resetSetup}>
-              Setup
+            <button className="settingsButton" onClick={openSettings}>
+              Settings
             </button>
           </div>
         </header>
 
+        {notice && <div className="systemNotice" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice("")}>×</button></div>}
+
         <section className="workspace">
           <aside className="commsPanel">
             <div className="panelHeader">
-              <span>COMMS</span>
+              <span>Conversation</span>
             </div>
 
-            <div className="messageList" ref={messageListRef}>
+            <div className="chatHistoryTools">              <button className="secondaryButton dangerSoft" onClick={clearChatHistory}>
+                Clear Chat
+              </button></div>
+<div className="messageList" ref={messageListRef} onScroll={(event) => { const list=event.currentTarget; const distance=list.scrollHeight-list.scrollTop-list.clientHeight; followChatRef.current=distance < 64; setShowChatBottom(distance > 160); }}>
               {messages.map((message, index) => (
                 <div key={index} className={`message ${message.role}`}>
                   <span className="messageRole">
@@ -2707,41 +2891,71 @@ function LoaHud({
                       : "YOU"}
                   </span>
                   <p>{message.text}</p>
+                  {message.images?.map((image, i) => <SavedChatImage key={image.id} image={image} index={i} />)}
                 </div>
               ))}
+            </div>
+
+            <div className="chatBottomAnchor">{showChatBottom && <button className="chatBottomButton" type="button" aria-label="Jump to latest message" title="Jump to latest message" onClick={() => { const list=messageListRef.current; if(list) { followChatRef.current=true; list.scrollTop=list.scrollHeight; setShowChatBottom(false); } }}><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M12 5v14m-6-6 6 6 6-6" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}</div>
+            <div className="commsComposer">
+              <input
+                ref={liveFileInputRef}
+                className="hiddenLiveFileInput"
+                type="file"
+                multiple
+                accept="image/*,.pdf,.txt,.md,.json,.csv,.tsv,.js,.jsx,.ts,.tsx,.css,.html,.xml,.yaml,.yml,.py,.java,.c,.cpp,.h,.hpp,.rs,.go,.sql,.sh,.ps1"
+                onChange={(event) => {
+                  if (event.target.files?.length) void addLiveFiles(event.target.files).catch((error) => pushLoaMessage(error instanceof Error ? error.message : "Could not attach this file."));
+                  event.target.value = "";
+                }}
+              />
+
+              {liveAttachments.length > 0 && (
+                <div className="liveAttachmentArea">
+                  <div className="liveAttachmentList">
+                    {liveAttachments.map((attachment, index) => (
+                      <div className="liveAttachmentChip" key={attachment.id}>
+                        <span>{attachment.kind === "image" ? "IMAGE" : attachment.kind === "pdf" ? "PDF" : "FILE"}</span>
+                        {attachment.kind === "image" && <img alt={`Image ${liveAttachments.slice(0,index+1).filter(a=>a.kind === "image").length}`} src={`data:${attachment.mimeType};base64,${attachment.base64Data}`} />}
+                        <strong>{attachment.kind === "image" ? `Image ${liveAttachments.slice(0,index+1).filter(a=>a.kind === "image").length} · ` : ""}{attachment.name}</strong>
+                        <button onClick={() => removeLiveAttachment(attachment.id)} type="button" aria-label={`Remove ${attachment.name}`}>×</button>
+                      </div>
+                    ))}
+                  </div>
+                  <p>{liveAttachments.length}/10 attachments · Press Send to share with Loa.</p>
+                </div>
+              )}
+
+              <div className="commsInputRow">
+                <button className="commsAttachButton" onClick={() => liveFileInputRef.current?.click()} type="button" aria-label="Attach file" title="Attach file">+</button>
+                <textarea
+                  ref={chatInputRef}
+                  onPaste={event => {
+                    const images = Array.from(event.clipboardData.items).filter(item => item.kind === 'file' && item.type.startsWith('image/')).map(item => item.getAsFile()).filter((file): file is File => file !== null);
+                    if(images.length){event.preventDefault();void addLiveFiles(images).catch(error => setNotice(String(error)));}
+                  }}
+                  value={chatText}
+                  onChange={(event) => setChatText(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      sendLiveChat();
+                    }
+                  }}
+                  placeholder={geminiLiveStatus === "connected" ? `Message ${config.loaName}...` : "Start Loa to chat..."}
+                  rows={1}
+                />
+                <button className="commsSendButton" onClick={sendLiveChat} disabled={geminiLiveStatus !== "connected" || (!chatText.trim() && liveAttachments.length === 0)} type="button" aria-label="Send message">↑</button>
+              </div>
             </div>
           </aside>
 
           <section className="mainColumn">
-            <div className="modeRow">
-              <button className="modeChip active">WORK</button>
-
-              <button className={`modeChip ${liveViewOn ? "active" : ""}`}>
-                LIVE VIEW
-              </button>
-
-              <button
-                className={`modeChip ${
-                  geminiLiveStatus === "connected" ? "active" : ""
-                }`}
-              >
-                VOICE: {config.geminiVoice}
-              </button>
-
-              <button
-                className={`modeChip ${showMemoryPanel ? "active" : ""}`}
-                onClick={() => setShowMemoryPanel((prev) => !prev)}
-              >
-                MEMORY: {memoryLabel}
-              </button>
-
-              <button
-                className={`modeChip ${showMemoryPanel ? "active" : ""}`}
-                onClick={() => setShowMemoryPanel((prev) => !prev)}
-              >
-                IDENTITY: READY
-              </button>
-            </div>
+            <nav className="modeRow" aria-label="Loa navigation">
+              <button className="modeChip active" onClick={() => setShowNotebook(false)}>Chat</button>
+              <button className="modeChip" onClick={() => {setNotebookTab("memory");setShowNotebook(true);}}>Memories</button>
+              <button className="modeChip" onClick={() => {setNotebookTab("journal");setShowNotebook(true);}}>Journal</button>
+            </nav>
 
             {pendingMemory && (
               <section className="memoryApprovalPanel">
@@ -2786,11 +3000,12 @@ function LoaHud({
                 <button
                   className={`voiceToggle ${isMicListening ? "on" : ""}`}
                   onClick={() => {
-                    if (geminiLiveStatus !== "connected") {
-                      setUseMicInput((prev) => !prev);
+                    if (geminiLiveStatus === "connected") {
+                      void toggleMicrophone();
+                      return;
                     }
+                    setUseMicInput((prev) => !prev);
                   }}
-                  disabled={geminiLiveStatus === "connected"}
                 >
                   <span>MIC</span>
                   <strong>
@@ -2818,32 +3033,14 @@ function LoaHud({
             </section>
 
             <section className="loaPanel">
-              <div className="loaVisualBlock">
-                <div
-                  className={`orbStage ${
-                    isSpeaking ||
-                    hermesStatus === "running" ||
-                    liveViewOn ||
-                    geminiLiveStatus === "connected"
-                      ? "speaking"
-                      : ""
-                  }`}
-                >
-                  <div className="ambientRing ringA" />
-                  <div className="ambientRing ringB" />
-
-                  <div className="pulse pulseOne" />
-                  <div className="pulse pulseTwo" />
-                  <div className="pulse pulseThree" />
-
-                  <div className="orbShell">
-                    <div className="orbCore" />
-                  </div>
-                </div>
+              <div className="atriaVoice" data-speaking={voiceLevel > .02} role="img" aria-label={voiceLevel > .02 ? "Loa is speaking" : "Loa is quiet"}>
+                <i className="atriaOrbit orbitOne"/><i className="atriaOrbit orbitTwo"/><i className="atriaOrbit orbitThree"/>
+                <i className="atriaLight" style={{transform:'translate(-50%,-50%) scale('+(1+voiceLevel*.8)+')'}}/>
+                <i className="atriaSatellite satelliteOne"/><i className="atriaSatellite satelliteTwo"/>
+                <i className="atriaWave"/><i className="atriaWave waveDelayed"/>
               </div>
-
               <div className="loaCopy">
-                <p className="heroLabel">ASSISTANT / LIVE VIEW</p>
+                <p className="heroLabel">YOUR SCREEN. OUR SPACE.</p>
                 <h2>{config.loaName}</h2>
                 <p className="heroState">{loaStateText}</p>
               </div>
@@ -2968,20 +3165,36 @@ function LoaHud({
                 ) : (
                   <div className="feedPlaceholder off">
                     <div className="feedGrid" />
-                    <span>NO SCREEN SOURCE</span>
+                    <span>Bring your world into view<small>Share a window, a game, or something you’re making.</small></span>
                   </div>
                 )}
               </div>
 
               <div className="sourceBar">
+              <button className="primaryButton" onClick={startScreenShare}>
+                Share Screen
+              </button>
+
+
+
+              <button
+                className="secondaryButton"
+                onClick={stopLiveView}
+                disabled={!liveViewOn}
+              >
+                Stop sharing
+              </button>
+
+<details className="cameraOptions"><summary>Camera / OBS (optional)</summary><details className="obsSetupHelp"><summary aria-label="How to connect OBS Virtual Camera"><span className="obsInfoIcon" aria-hidden="true">i</span><span>How to use OBS</span></summary><div className="obsSetupContent"><strong>No streaming or recording needed.</strong><ol><li>In OBS, add Game Capture (or another source) and check that your game appears in the preview.</li><li>Click Start Virtual Camera in OBS.</li><li>Here, select OBS Virtual Camera and click Start camera. If it is missing, click Rescan cameras.</li><li>Click Start Loa to talk together. Keep OBS and its virtual camera running.</li></ol><p>OBS is optional. Share Screen captures a screen or window directly. You can also select a regular webcam here.</p></div></details><div className="cameraOptionsBody">
                 <select
+                  aria-label="Camera source"
                   className="sourceSelect"
                   value={selectedVideoDeviceId}
                   onChange={(event) =>
                     setSelectedVideoDeviceId(event.target.value)
                   }
                 >
-                  <option value="">Camera source</option>
+                  <option value="">Default camera</option>
                   {videoDevices.map((device, index) => (
                     <option key={device.deviceId} value={device.deviceId}>
                       {device.label || `Camera ${index + 1}`}
@@ -2989,43 +3202,22 @@ function LoaHud({
                   ))}
                 </select>
 
+                <button className="secondaryButton" onClick={startCameraSource}>Start camera</button>
                 <button className="tinyButton" onClick={refreshVideoDevices}>
-                  Refresh
+                  Rescan cameras
                 </button>
+                </div></details>
               </div>
             </section>
 
-            <div className="actions">
-              <div className="privacyStatus" role="status" aria-live="polite">
-                <span className={liveViewOn ? "privacyDot active" : "privacyDot"} />
-                {liveViewOn
-                  ? `${liveSource === "screen" ? "Screen" : "Camera"} sharing on`
-                  : geminiLiveStatus === "connected" && isMicListening
-                  ? "Microphone sharing on"
-                  : "Nothing is being shared"}
-              </div>
-
-              <button className="primaryButton" onClick={startScreenShare}>
-                Share Screen
-              </button>
-
-              <button className="secondaryButton" onClick={startCameraSource}>
-                OBS Camera
-              </button>
-
-              <button
-                className="secondaryButton"
-                onClick={stopLiveView}
-                disabled={!liveViewOn}
-              >
-                Stop View
-              </button>
-
+            <div className="actions voiceActions" aria-label="Voice controls">
+              {geminiLiveStatus === "connected" && <button className="secondaryButton" title="Restart voice while keeping saved chat and memories" disabled={geminiLiveStatus !== "connected"} onClick={() => { audioPlayerRef.current?.stop(); reconnectAttemptRef.current = 0; connectGeminiLiveShell(true); setNotice("Restarting Live with saved memories and recent conversation. Nothing was deleted."); }}>Restart Loa</button>}
+              {geminiLiveStatus !== "connected" && <button className="secondaryButton" aria-pressed={!useMicInput} onClick={() => setUseMicInput(value => !value)}>{useMicInput ? "Mute" : "Unmute"}</button>}
               {geminiLiveStatus === "connected" ? (
                 <>
                   <button
                     className="secondaryButton"
-                    onClick={isSoftSleeping ? wakeMic : isMicListening ? sleepMic : wakeMic}
+                    onClick={() => void toggleMicrophone()}
                   >
                     {micButtonText}
                   </button>
@@ -3034,7 +3226,7 @@ function LoaHud({
                     className="secondaryButton"
                     onClick={disconnectGeminiLiveShell}
                   >
-                    End Live
+                    Stop Loa
                   </button>
                 </>
               ) : (
@@ -3044,35 +3236,28 @@ function LoaHud({
                   disabled={geminiLiveStatus === "connecting"}
                 >
                   {geminiLiveStatus === "connecting"
-                    ? "Connecting Live..."
-                    : "Connect Live"}
+                    ? "Starting Loa…"
+                    : "Start Loa"}
                 </button>
               )}
 
               <button
                 className="secondaryButton"
-                onClick={runHermesSearch}
-                disabled={
-                  hermesStatus === "starting" || hermesStatus === "running"
-                }
+                onClick={() => setShowHermesInfo(true)}
+                aria-haspopup="dialog"
               >
                 {hermesButtonText}
               </button>
 
-              <button className="secondaryButton dangerSoft" onClick={clearChatHistory}>
-                Clear Chat
-              </button>
 
-              <button
-                className="secondaryButton privacyStop"
-                onClick={stopAllSharing}
-                disabled={!liveViewOn && geminiLiveStatus === "disconnected"}
-              >
-                Stop All Sharing
-              </button>
             </div>
           </section>
         </section>
+        <NotebookPanel initialTab={notebookTab} onClose={() => setShowNotebook(false)} connected={geminiLiveStatus === "connected"} onJournal={() => {
+          journalRequestedRef.current = true; journalTextRef.current = "";
+          geminiLiveClientRef.current?.sendText("Write a short personal journal about our actual conversation today, in the user’s current language. Preserve what happened, its context, why it mattered, and feelings explicitly expressed. Separate your interpretations from facts. Do not invent events or use command/memory tags. The user will review and edit this draft.");
+          setNotice("Writing a journal draft through the current voice session. It will also be spoken aloud.");
+        }} onRestore={() => window.location.reload()} />
       </div>
     </main>
   );
@@ -3082,17 +3267,14 @@ export default function App() {
   const [config, setConfig] = useState<LoaConfig | null>(() =>
     loadStoredConfig()
   );
+  const [isEditingSettings, setIsEditingSettings] = useState(false);
 
   if (!config) {
     return <SetupWizard onComplete={setConfig} />;
   }
 
-  return (
-    <LoaHud
-      config={config}
-      onResetSetup={() => {
-        setConfig(null);
-      }}
-    />
-  );
+  return <>
+    <LoaHud config={config} onOpenSettings={() => setIsEditingSettings(true)} />
+    {isEditingSettings && <SettingsPanel config={config} onClose={() => setIsEditingSettings(false)} onSave={next => { saveStoredConfig(next); setConfig(next); setIsEditingSettings(false); }} />}
+  </>;
 }

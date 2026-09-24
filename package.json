@@ -1,17 +1,17 @@
 {
-  "name": "loa",
+  "name": "loa-hud",
   "private": true,
-  "version": "0.1.0",
-  "description": "A local-first Gemini Live companion HUD for voice, screen context, OBS, and Hermes tasks.",
-  "license": "MIT",
+  "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node tests/regression.mjs"
   },
   "dependencies": {
+    "pdfjs-dist": "^6.2.108",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
